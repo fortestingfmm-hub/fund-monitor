@@ -40,7 +40,7 @@ def get_market_data():
 def get_valuation(fund_code):
     # 1. 获取基金持仓
     try:
-        portfolio = ak.fund_portfolio_hold_em(code=fund_code)
+        portfolio = ak.fund_portfolio_hold_em(symbol=fund_code)
         if portfolio.empty:
             return None, "未找到持仓数据", 0
             
@@ -146,4 +146,5 @@ if st.button("开始计算", type="primary"):
                          title="重仓股涨跌幅 (含港股)",
                          color_continuous_scale=['green', '#f0f0f0', 'red'],
                          range_color=[-5, 5])
+
             st.plotly_chart(fig, use_container_width=True)
