@@ -38,12 +38,33 @@ def get_market_data():
         return {}, str(e)
 
 def get_valuation(fund_code):
-    # 1. 获取基金持仓
-    try:
-        portfolio = ak.fund_portfolio_hold_em(symbol=fund_code)
-        if portfolio.empty:
-            return None, "未找到持仓数据", 0
+    # --- 内部函数：尝试获取数据 ---
+    def fetch_data(source_type):
+        try:
+            if source_type == "em": # 东方财富接口
+                return ak.fund_portfolio_hold_em(symbol=fund_code)
+            elif source_type == "cninfo": # 巨潮资讯接口 (备用)
+                return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
+        except:
+            return pd.DataFrame() # 出错返回空表
             
+    # 1. 尝试主接口 (东方财富)
+    portfolio = fetch_data("em")
+    
+    # 2. 如果主接口没数据，尝试备用接口 (巨潮资讯)
+    if portfolio.empty:
+        # st.toast 会在右上角弹个小提示，告诉你切换了数据源
+        st.toast(f"东方财富无数据，正在切换至巨潮资讯源查询 {fund_code}...", icon="🔄")
+        portfolio = fetch_data("cninfo")
+    
+    # 3. 如果还是空，那就真的没救了
+    if portfolio.empty:
+        return None, "未找到持仓数据 (可能因基金类型特殊或云端IP被拦截)", 0
+
+    try:
+        # 数据清洗：确保年份是数字
+        portfolio['年份'] = portfolio['年份'].astype(str).astype(int)
+        
         # 筛选最新季度
         latest_year = portfolio['年份'].max()
         df_year = portfolio[portfolio['年份'] == latest_year]
@@ -65,9 +86,6 @@ def get_valuation(fund_code):
             weight = float(row['占净值比例'])
             
             # --- 核心匹配逻辑 ---
-            # 基金持仓里的港股代码有时是 00700 (5位)，有时带后缀
-            # 我们直接在 market_map 里找
-            
             current_change = 0.0
             found = False
             
@@ -148,3 +166,4 @@ if st.button("开始计算", type="primary"):
                          range_color=[-5, 5])
 
             st.plotly_chart(fig, use_container_width=True)
+
