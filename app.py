@@ -2,291 +2,265 @@ import streamlit as st
 import akshare as ak
 import pandas as pd
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 页面配置 ---
-st.set_page_config(page_title="基金估值(纯净版)", page_icon="🍃", layout="wide")
-st.title("🍃 基金实时估值")
-st.caption("内置名称库 | 年份地毯式搜索 | 实时调试日志")
+st.set_page_config(page_title="基金估值(稳健版)", page_icon="🐢", layout="wide")
+st.title("🐢 基金实时估值 (单线程稳健版)")
+st.caption("排队查询 | 防封IP | 专治161226无数据")
 
 # ==========================================
-# 0. 内置名称字典 (兜底用)
+# 0. 内置名称字典 (兜底保障)
 # ==========================================
 MANUAL_NAMES = {
     "005827": "易方达蓝筹精选混合",
     "161226": "建信优选成长混合(LOF)",
     "110011": "易方达中小盘混合",
     "000001": "华夏成长混合",
-    "510300": "华泰柏瑞沪深300ETF",
-    "510500": "南方中证500ETF"
+    "510300": "华泰柏瑞沪深300ETF"
 }
 
 # ==========================================
-# 1. 核心功能: 暴力获取持仓 & 名称
+# 1. 核心功能: 获取持仓 (单线程 + 延时)
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
-def get_all_fund_holdings(fund_codes_list):
-    """批量获取基金持仓，并缓存到硬盘"""
-    logs = [] 
+def get_all_fund_holdings_sequential(fund_codes_list):
+    """
+    【降速模式】一个一个查，中间休息，防止被封
+    """
+    results = {}
+    logs = []
 
-    # --- 内部函数：获取真实名称 ---
-    def get_real_name(code):
-        if code in MANUAL_NAMES: return MANUAL_NAMES[code]
-        try:
-            df_info = ak.fund_individual_basic_info_em(symbol=code)
-            for key in ["基金简称", "基金全称", "基金名称"]:
-                rows = df_info[df_info.iloc[:, 0] == key]
-                if not rows.empty: return rows.iloc[0, 1]
-            return f"基金{code}"
-        except: return f"基金{code}"
+    # 定义进度条
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
-    # --- 内部函数：获取持仓 ---
-    def fetch_one_fund(code):
-        log_msg = f"[{code}]"
-        real_name = get_real_name(code)
+    for i, code in enumerate(fund_codes_list):
+        status_text.text(f"🐢 正在慢速挖掘: {code} ({i+1}/{len(fund_codes_list)})...")
         
-        years_to_try = [2025, 2024, 2023]
-        found_df = pd.DataFrame()
-        success_year = ""
-
-        # 1. 默认接口
+        # --- 1. 获取名称 ---
+        real_name = MANUAL_NAMES.get(code, f"基金{code}")
         try:
-            df = ak.fund_portfolio_hold_em(symbol=code)
-            if not df.empty:
-                found_df = df
-                success_year = "默认"
+            # 尝试联网获取真名
+            df_info = ak.fund_individual_basic_info_em(symbol=code)
+            for key in ["基金简称", "基金全称"]:
+                rows = df_info[df_info.iloc[:, 0] == key]
+                if not rows.empty: 
+                    real_name = rows.iloc[0, 1]
+                    break
         except: pass
 
-        # 2. 遍历年份
+        # --- 2. 获取持仓 (特定策略) ---
+        found_df = pd.DataFrame()
+        success_source = "失败"
+        
+        # 策略A: 161226 特供 (优先查2024年，因为它更新慢)
+        if code == "161226":
+            try:
+                df = ak.fund_portfolio_hold_em(symbol=code, date="2024")
+                if not df.empty:
+                    found_df = df
+                    success_source = "2024(特供)"
+            except: pass
+
+        # 策略B: 正常查询 (默认 -> 2025 -> 2024)
         if found_df.empty:
-            for year in years_to_try:
-                try:
-                    df = ak.fund_portfolio_hold_em(symbol=code, date=str(year))
-                    if not df.empty:
-                        found_df = df
-                        success_year = str(year)
-                        break 
-                except: pass
-
+            try:
+                df = ak.fund_portfolio_hold_em(symbol=code)
+                if not df.empty:
+                    found_df = df
+                    success_source = "默认"
+            except: pass
+        
         if found_df.empty:
-            return {"code": code, "name": real_name, "holdings": [], "log": log_msg + " ❌全空"}
-
-        # 3. 解析
-        try:
-            df = found_df
-            cols = df.columns.tolist()
-            if '季度' in cols:
-                df = df.sort_values(by='季度', ascending=False)
-                df = df[df['季度'] == df.iloc[0]['季度']]
-            elif '截止报告期' in cols:
-                df = df.sort_values(by='截止报告期', ascending=False)
-                df = df[df['截止报告期'] == df.iloc[0]['截止报告期']]
-            elif '年份' in cols:
-                df = df[df['年份'] == df['年份'].max()]
-
-            df = df.head(10)
+            try:
+                df = ak.fund_portfolio_hold_em(symbol=code, date="2025")
+                if not df.empty:
+                    found_df = df
+                    success_source = "2025"
+            except: pass
             
-            clean_holdings = []
-            for _, row in df.iterrows():
-                s_code = str(row.get('股票代码', row.get('代码', row.get('证券代码', ''))))
-                s_name = row.get('股票名称', row.get('简称', row.get('证券名称', '未知')))
-                w_val = row.get('占净值比例', row.get('市值占净值比', row.get('持仓比例', 0)))
-                try: w_float = float(w_val)
-                except: w_float = 0.0
+        if found_df.empty:
+            try:
+                df = ak.fund_portfolio_hold_em(symbol=code, date="2024")
+                if not df.empty:
+                    found_df = df
+                    success_source = "2024"
+            except: pass
 
-                if s_code: 
-                    clean_holdings.append({'c': s_code, 'n': s_name, 'w': w_float})
-            
-            return {"code": code, "name": real_name, "holdings": clean_holdings, "log": log_msg + f" ✅{success_year}"}
+        # --- 3. 解析数据 ---
+        clean_holdings = []
+        if not found_df.empty:
+            try:
+                df = found_df
+                # 排序找最新
+                cols = df.columns.tolist()
+                if '季度' in cols:
+                    df = df.sort_values(by='季度', ascending=False)
+                    df = df[df['季度'] == df.iloc[0]['季度']]
+                elif '截止报告期' in cols:
+                    df = df.sort_values(by='截止报告期', ascending=False)
+                    df = df[df['截止报告期'] == df.iloc[0]['截止报告期']]
+                elif '年份' in cols:
+                    df = df[df['年份'] == df['年份'].max()]
 
-        except Exception as e:
-            return {"code": code, "name": real_name, "holdings": [], "log": log_msg + f" ⚠️解析错:{e}"}
+                df = df.head(10)
+                
+                for _, row in df.iterrows():
+                    s_code = str(row.get('股票代码', row.get('代码', '')))
+                    s_name = row.get('股票名称', row.get('简称', '未知'))
+                    w_val = row.get('占净值比例', row.get('市值占净值比', 0))
+                    try: w = float(w_val)
+                    except: w = 0.0
+                    if s_code:
+                        clean_holdings.append({'c': s_code, 'n': s_name, 'w': w})
+            except Exception as e:
+                logs.append(f"❌ {code} 解析错误: {e}")
 
-    # 多线程
-    results = {}
-    logs_output = []
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        future_map = {executor.submit(fetch_one_fund, code): code for code in fund_codes_list}
-        for future in as_completed(future_map):
-            res = future.result()
-            results[res['code']] = res
-            logs_output.append(res['log'])
-    
-    return results, logs_output
+        # 记录结果
+        results[code] = {
+            "code": code,
+            "name": real_name,
+            "holdings": clean_holdings
+        }
+        
+        if clean_holdings:
+            logs.append(f"✅ {code}: 获取成功 ({success_source})")
+        else:
+            logs.append(f"❌ {code}: 获取失败 (已尝试所有年份)")
+
+        # 更新进度条
+        progress_bar.progress((i + 1) / len(fund_codes_list))
+        
+        # 关键一步：休息 0.5 秒，防止被封 IP
+        time.sleep(0.5)
+
+    status_text.empty()
+    progress_bar.empty()
+    return results, logs
 
 # ==========================================
-# 2. 核心功能: 市场行情
+# 2. 获取行情 (依然可以快一点)
 # ==========================================
 @st.cache_data(ttl=30, show_spinner=False)
-def get_market_data_fast():
+def get_market_data():
     market_map = {}
-    def get_a():
-        try:
-            df = ak.stock_zh_a_spot_em()
-            return {str(row['代码']): float(row['涨跌幅']) for _, row in df.iterrows() if row['涨跌幅'] is not None}
-        except: return {}
-    def get_hk():
-        try:
-            df = ak.stock_hk_spot_em()
-            return {str(row['代码']): float(row['涨跌幅']) for _, row in df.iterrows() if row['涨跌幅'] is not None}
-        except: return {}
-
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        fa = executor.submit(get_a)
-        fh = executor.submit(get_hk)
-        market_map.update(fa.result())
-        market_map.update(fh.result())
+    try:
+        df = ak.stock_zh_a_spot_em()
+        for _, r in df.iterrows():
+            if r['涨跌幅'] is not None: market_map[str(r['代码'])] = float(r['涨跌幅'])
+    except: pass
+    try:
+        df = ak.stock_hk_spot_em()
+        for _, r in df.iterrows():
+            if r['涨跌幅'] is not None: market_map[str(r['代码'])] = float(r['涨跌幅'])
+    except: pass
     return market_map
 
 # ==========================================
 # 3. 计算逻辑
 # ==========================================
-def calculate_valuation(fund_codes, holdings_data, market_map):
+def calculate(fund_codes, holdings_data, market_map):
     final_list = []
-    
     for code in fund_codes:
         data = holdings_data.get(code)
-        
         if not data or not data['holdings']:
+            # 即使没数据，也尽量显示个名字
             fallback_name = MANUAL_NAMES.get(code, f"基金{code}")
+            real_name = data.get('name', fallback_name) if data else fallback_name
             final_list.append({
-                "代码": code, "名称": data.get('name', fallback_name) if data else fallback_name,
-                "估值": 0.0, "状态": "❌ 无数据", "港股含量": 0, "明细": pd.DataFrame()
+                "代码": code, "名称": real_name, "估值": 0.0, 
+                "状态": "❌ 暂无持仓", "港股含量": 0, "明细": pd.DataFrame()
             })
             continue
 
-        total_val = 0.0
-        hk_cnt = 0
+        total = 0.0
+        hk = 0
         details = []
-
         for item in data['holdings']:
-            s_code = item['c']
-            weight = item['w']
-            is_hk = len(s_code) == 5
-            if is_hk: hk_cnt += 1
+            sc = item['c']
+            w = item['w']
+            if len(sc) == 5: hk += 1
             
-            change = 0.0
+            chg = 0.0
             found = False
-            
-            keys = [s_code, "0"+s_code, s_code.split('.')[0]]
-            for k in keys:
+            for k in [sc, "0"+sc, sc.split('.')[0]]:
                 if k in market_map:
-                    change = market_map[k]
+                    chg = market_map[k]
                     found = True
                     break
-            if not found and is_hk and s_code in market_map:
-                 change = market_map[s_code]
-            
-            contrib = change * (weight / 100)
-            total_val += contrib
-            
-            details.append({
-                "股票代码": s_code,
-                "股票名称": item['n'],
-                "权重": weight,
-                "今日涨跌%": change,
-                "贡献度": contrib
-            })
+            if not found and len(sc) == 5 and sc in market_map:
+                chg = market_map[sc]
 
-        status = f"🇭🇰 港({hk_cnt})" if hk_cnt > 0 else "🇨🇳 A"
-        
+            total += chg * (w / 100)
+            details.append({
+                "股票代码": sc, "股票名称": item['n'], "权重": w,
+                "今日涨跌%": chg, "贡献度": chg * (w/100)
+            })
+            
         final_list.append({
-            "代码": code,
-            "名称": data['name'],
-            "估值": round(total_val, 2),
-            "状态": status,
-            "港股含量": hk_cnt,
-            "明细": pd.DataFrame(details)
+            "代码": code, "名称": data['name'], "估值": round(total, 2),
+            "状态": f"🇭🇰 港({hk})" if hk>0 else "🇨🇳 A",
+            "港股含量": hk, "明细": pd.DataFrame(details)
         })
-        
     return final_list
 
 # --- 样式 ---
-def style_text_color(val):
+def style_color(val):
     if not isinstance(val, (int, float)): return ''
-    color = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
-    return f'color: {color}; font-weight: bold'
+    c = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
+    return f'color: {c}; font-weight: bold'
 
-def style_bg_color(val):
-    if not isinstance(val, (int, float)): return ''
-    if val > 0: return 'background-color: #ffcdd2; color: black'
-    if val < 0: return 'background-color: #c8e6c9; color: black'
-    return ''
-
-# --- 界面 UI ---
+# --- 界面 ---
 with st.sidebar:
-    st.header("⚡ 控制台")
+    st.header("🐢 控制台")
+    codes_input = st.text_area("代码池", value="", placeholder="请输入代码，每行一个\n161226\n005827", height=200)
+    fund_codes = [x.strip() for x in codes_input.split('\n') if x.strip()]
     
-    # ⭐ 修改点：这里去掉了 value=...，默认就是空的 ⭐
-    codes_input = st.text_area(
-        "代码池", 
-        value="", 
-        placeholder="请输入基金代码，每行一个\n例如：\n005827\n161226", 
-        height=200
-    )
+    c1, c2 = st.columns(2)
+    with c1: refresh = st.button("🚀 刷新股价", type="primary", use_container_width=True)
+    with c2: update = st.button("📂 更新持仓", help="非常慢，但很稳", use_container_width=True)
     
-    fund_codes = [line.strip() for line in codes_input.split('\n') if line.strip()]
-    
-    col1, col2 = st.columns(2)
-    with col1:
-        refresh_price = st.button("🚀 仅刷新股价", type="primary", use_container_width=True)
-    with col2:
-        update_holdings = st.button("📂 更新持仓/名称", use_container_width=True)
-    
-    if update_holdings:
-        get_all_fund_holdings.clear() 
-        st.toast("已清除缓存", icon="🧹")
+    if update:
+        get_all_fund_holdings_sequential.clear()
+        st.toast("缓存已清空", icon="🧹")
 
-# 主逻辑
-if refresh_price or update_holdings or 'last_result' not in st.session_state:
+if refresh or update or 'res' not in st.session_state:
     if not fund_codes:
-        # 如果是空的，什么都不做，或者显示一个提示
-        st.info("👈 请在左侧输入基金代码开始监控")
+        st.info("👈 请在左侧输入代码")
     else:
-        with st.spinner("📦 正在挖掘持仓..."):
-            holdings_data, logs = get_all_fund_holdings(fund_codes)
-            
-        with st.sidebar.status("🕵️ 数据抓取日志", expanded=False):
-            for log in logs: st.write(log)
+        # 1. 慢速获取持仓
+        with st.spinner("📦 正在排队挖掘持仓 (防封模式)..."):
+            holdings, logs = get_all_fund_holdings_sequential(fund_codes)
         
-        with st.spinner("📈 正在拉取行情..."):
-            market_map = get_market_data_fast()
+        with st.sidebar.status("📜 抓取日志", expanded=True):
+            for l in logs: st.write(l)
             
-        results = calculate_valuation(fund_codes, holdings_data, market_map)
-        st.session_state['last_result'] = results
+        # 2. 获取行情
+        with st.spinner("📈 拉取行情..."):
+            market = get_market_data()
+            
+        # 3. 计算
+        res = calculate(fund_codes, holdings, market)
+        st.session_state['res'] = res
 
-# 展示逻辑
-if 'last_result' in st.session_state and fund_codes:
-    results = st.session_state['last_result']
-    df_res = pd.DataFrame(results)
-    
-    st.subheader("🔥 估值看板")
+if 'res' in st.session_state and fund_codes:
+    df = pd.DataFrame(st.session_state['res'])
+    st.subheader("🐢 稳健估值表")
     st.dataframe(
-        df_res[['代码', '名称', '估值', '状态']].style.applymap(style_text_color, subset=['估值'])
-                    .format({"估值": "{:+.2f}%"}),
-        use_container_width=True, hide_index=True
+        df[['代码', '名称', '估值', '状态']].style.applymap(style_color, subset=['估值'])
+        .format({"估值": "{:+.2f}%"}), use_container_width=True, hide_index=True
     )
     
     st.divider()
     
-    st.subheader("🔍 持仓透视")
-    names = [f"{r['代码']} - {r['名称']}" for r in results]
+    names = [f"{r['代码']} - {r['名称']}" for r in st.session_state['res']]
     if names:
-        sel = st.selectbox("选择基金：", names)
-        target = next((r for r in results if r['代码'] == sel.split(' - ')[0]), None)
-        
-        if target and not target['明细'].empty:
-            c1, c2, c3 = st.columns(3)
-            c1.metric("名称", target['名称'])
-            c2.metric("估值", f"{target['估值']:.2f}%")
-            c3.metric("港股", f"{target['港股含量']}")
-            
-            st.dataframe(
-                target['明细'].style
-                    .applymap(style_bg_color, subset=['今日涨跌%'])
-                    .applymap(style_text_color, subset=['贡献度'])
-                    .format({"权重": "{:.2f}%", "今日涨跌%": "{:.2f}%", "贡献度": "{:.4f}%"}),
-                use_container_width=True, hide_index=True
-            )
+        sel = st.selectbox("查看详情:", names)
+        tgt = next((r for r in st.session_state['res'] if r['代码'] == sel.split(' - ')[0]), None)
+        if tgt and not tgt['明细'].empty:
+            c1, c2 = st.columns(2)
+            c1.metric("名称", tgt['名称'])
+            c2.metric("估值", f"{tgt['估值']:.2f}%")
+            st.dataframe(tgt['明细'].style.format("{:.2f}%", subset=['权重','今日涨跌%']), use_container_width=True)
         else:
-            st.info("该基金暂无持仓明细")
+            st.warning("暂无明细数据")
