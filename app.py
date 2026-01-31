@@ -7,15 +7,14 @@ import time
 # --- 页面配置 ---
 st.set_page_config(page_title="基金实时估值看板", page_icon="📊", layout="wide")
 st.title("📊 基金实时估值看板")
-st.caption("批量监控 | 强制刷新 | 持仓透视")
+st.caption("批量监控 | 强制刷新 | 持仓透视 | 兼容修复版")
 
 # --- 核心功能 1: 获取全市场行情 (带重试 & 缓存) ---
-# 缓存时间设为60秒，避免频繁请求被封
 @st.cache_data(ttl=60)
 def get_market_data():
     market_map = {}
     
-    # 1. A股 (尝试3次)
+    # 1. A股
     for i in range(3):
         try:
             df_a = ak.stock_zh_a_spot_em()
@@ -26,10 +25,9 @@ def get_market_data():
                     market_map[code] = float(val) if val is not None else 0.0
                 except: continue
             break 
-        except:
-            time.sleep(1)
+        except: time.sleep(1)
     
-    # 2. 港股 (尝试3次)
+    # 2. 港股
     for i in range(3):
         try:
             df_hk = ak.stock_hk_spot_em()
@@ -40,31 +38,37 @@ def get_market_data():
                     market_map[code] = float(val) if val is not None else 0.0
                 except: continue
             break
-        except:
-            time.sleep(1)
+        except: time.sleep(1)
 
     return market_map
 
-# --- 核心功能 2: 计算单个基金 (返回 估值 + 持仓明细表) ---
-# 注意：这里去掉了缓存，因为我们要允许用户强制刷新
+# --- 核心功能 2: 计算单个基金 (安全防御版) ---
 def calculate_single_fund(fund_code, market_map):
     
-    # 内部函数：获取原始数据
+    # 内部函数：安全的获取数据
     def try_fetch(source, specific_year=None):
         try:
             if specific_year:
+                # 强制转为字符串年份，防止整数报错
                 return ak.fund_portfolio_hold_em(symbol=fund_code, date=str(specific_year))
             else:
-                if source == 'em': return ak.fund_portfolio_hold_em(symbol=fund_code)
-                if source == 'cninfo': return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
-        except:
-            return pd.DataFrame()
+                if source == 'em': 
+                    return ak.fund_portfolio_hold_em(symbol=fund_code)
+                if source == 'cninfo': 
+                    # 🚑 关键修复：如果你版本老，没有这个功能，这里会报错
+                    # 我们捕获这个错误，不让程序崩
+                    if hasattr(ak, 'fund_portfolio_hold_cninfo'):
+                        return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
+                    else:
+                        return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame() # 任何错误都返回空表，不报错
 
-    # 1. 获取数据 (自动修复策略)
-    portfolio = try_fetch('em')
-    if portfolio.empty: portfolio = try_fetch('em', specific_year=2025)
-    if portfolio.empty: portfolio = try_fetch('cninfo')
-    if portfolio.empty: portfolio = try_fetch('em', specific_year=2024)
+    # 1. 获取数据 (梯队式挖掘)
+    portfolio = try_fetch('em') # 尝试默认
+    if portfolio.empty: portfolio = try_fetch('em', specific_year=2025) # 尝试2025
+    if portfolio.empty: portfolio = try_fetch('em', specific_year=2024) # 尝试2024 (161226救星)
+    if portfolio.empty: portfolio = try_fetch('cninfo') # 尝试备用
 
     if portfolio.empty:
         return {
@@ -74,7 +78,11 @@ def calculate_single_fund(fund_code, market_map):
 
     # 2. 解析数据
     try:
-        fund_name = portfolio.iloc[0]['基金名称'] if '基金名称' in portfolio.columns else f"基金{fund_code}"
+        # 尝试获取名称
+        fund_name = f"基金{fund_code}"
+        if '基金名称' in portfolio.columns and not portfolio.empty:
+            fund_name = portfolio.iloc[0]['基金名称']
+
         cols = portfolio.columns.tolist()
         holdings = pd.DataFrame()
 
@@ -90,12 +98,12 @@ def calculate_single_fund(fund_code, market_map):
         else:
             holdings = portfolio.head(10)
 
-        holdings = holdings.head(10) # 前十大
+        holdings = holdings.head(10)
         
-        # 3. 计算估值 & 生成明细表
+        # 3. 计算估值
         total_contribution = 0
         hk_count = 0
-        details_list = [] # 用于存储明细
+        details_list = []
         
         for _, row in holdings.iterrows():
             s_code = str(row.get('股票代码', row.get('代码', '')))
@@ -118,7 +126,6 @@ def calculate_single_fund(fund_code, market_map):
             contribution = change * (weight / 100)
             total_contribution += contribution
             
-            # 添加到明细列表
             details_list.append({
                 "股票代码": s_code,
                 "股票名称": s_name,
@@ -136,7 +143,7 @@ def calculate_single_fund(fund_code, market_map):
             "估值": round(total_contribution, 2),
             "状态": status,
             "港股含量": hk_count,
-            "明细": pd.DataFrame(details_list) # 把明细表藏在结果里
+            "明细": pd.DataFrame(details_list)
         }
 
     except:
@@ -155,30 +162,24 @@ with st.sidebar:
     
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        # 普通刷新（利用缓存，速度快）
         refresh = st.button("🚀 刷新", type="primary", use_container_width=True)
     with col_btn2:
-        # 强制刷新（清除缓存，重新联网）
         force_refresh = st.button("🔄 强制更新", use_container_width=True)
         
     if force_refresh:
-        st.cache_data.clear() # 清空缓存指令
-        st.toast("缓存已清空，正在从交易所重新抓取...", icon="🧹")
+        st.cache_data.clear()
+        st.toast("缓存已清空，正在重连...", icon="🧹")
 
-# 逻辑控制
 if refresh or force_refresh or 'data_cache' not in st.session_state:
     if not fund_codes:
         st.warning("请在左侧添加代码")
     else:
-        # 1. 进度条
         progress = st.progress(0)
         status = st.empty()
         
-        # 2. 获取行情
         with st.spinner("正在连接交易所..."):
             market_map = get_market_data()
         
-        # 3. 计算所有基金
         results = []
         for i, code in enumerate(fund_codes):
             status.text(f"正在分析 {code} ...")
@@ -188,18 +189,13 @@ if refresh or force_refresh or 'data_cache' not in st.session_state:
         
         status.empty()
         progress.empty()
-        
-        # 将结果存入 session_state 以便交互时不会消失
         st.session_state['data_cache'] = results
 
-# --- 展示区域 ---
 if 'data_cache' in st.session_state:
     results = st.session_state['data_cache']
     df_res = pd.DataFrame(results)
     
-    # 1. 汇总大表
     st.subheader("📋 估值汇总")
-    
     def color_val(val):
         c = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
         return f'color: {c}; font-weight: bold'
@@ -213,46 +209,29 @@ if 'data_cache' in st.session_state:
     
     st.divider()
 
-    # 2. 持仓详情透视 (你想要的功能！)
     st.subheader("🔍 单只基金持仓透视")
-    
-    # 下拉选择框
     selected_fund_name = st.selectbox(
-        "选择要查看详情的基金：", 
+        "选择基金查看详情：", 
         options=[f"{r['代码']} - {r['名称']}" for r in results]
     )
     
-    # 找到选中的那个基金的数据
     selected_code = selected_fund_name.split(' - ')[0]
     target_data = next((item for item in results if item["代码"] == selected_code), None)
     
     if target_data and target_data['明细'] is not None:
-        detail_df = target_data['明细']
-        
-        # 展示 3 列布局：基本信息
         c1, c2, c3 = st.columns(3)
-        c1.metric("基金名称", target_data['名称'])
-        c2.metric("实时估值", f"{target_data['估值']:.2f}%", 
-                  delta=f"{target_data['估值']:.2f}%", delta_color="normal")
-        c3.metric("港股数量", f"{target_data['港股含量']} 只")
+        c1.metric("名称", target_data['名称'])
+        c2.metric("估值", f"{target_data['估值']:.2f}%", delta_color="normal")
+        c3.metric("港股", f"{target_data['港股含量']} 只")
         
-        # 展示详细持仓表
-        st.write("▼ 前十大重仓股实时表现")
         st.dataframe(
-            detail_df.style.format({
+            target_data['明细'].style.format({
                 "权重": "{:.2f}%", "今日涨跌%": "{:.2f}%", "贡献度": "{:.4f}%"
             }).background_gradient(subset=['今日涨跌%'], cmap='RdYlGn_r', vmin=-5, vmax=5),
             use_container_width=True,
             hide_index=True
         )
-        
-        # 刷新当前持仓的按钮（只针对视图）
-        if st.button("🔄 仅刷新此持仓明细"):
-            st.cache_data.clear()
-            st.experimental_rerun()
-            
     else:
-        st.warning("该基金暂无持仓明细数据")
-
+        st.warning("暂无持仓明细（可能使用了历史数据或获取失败）")
 else:
-    st.info("👈 点击左侧刷新按钮开始")
+    st.info("👈 点击刷新")
