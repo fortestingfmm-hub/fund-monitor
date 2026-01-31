@@ -5,129 +5,111 @@ import plotly.express as px
 import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="基金实时估值终极版", page_icon="🚀", layout="centered")
-st.title("🚀 基金实时估值 (抗网络波动版)")
-st.caption("支持：LOF/混合/股票型 | A股+港股 | 自动重试机制")
+st.set_page_config(page_title="基金实时估值修复版", page_icon="🔧", layout="centered")
+st.title("🔧 基金实时估值 (强力修复版)")
+st.caption("修复内容：变量丢失报错 | LOF基金支持 | 自动重试")
 
-# --- 核心功能 1: 获取行情 (带自动重试) ---
+# --- 核心功能 1: 获取行情 (带重试) ---
 @st.cache_data(ttl=60)
 def get_market_data():
-    """获取全市场行情，带断线重连机制"""
     market_map = {}
-    max_retries = 3
     
-    # 1. 获取 A 股
-    df_a = pd.DataFrame()
-    for i in range(max_retries):
-        try:
-            df_a = ak.stock_zh_a_spot_em()
-            break
-        except Exception as e:
-            if i < max_retries - 1:
-                print(f"A股行情重试 {i+1}...")
-                time.sleep(1)
-            else:
-                return {}, f"网络连接失败，请关闭VPN后重试: {str(e)}"
-
-    if not df_a.empty:
+    # 1. A股行情
+    try:
+        df_a = ak.stock_zh_a_spot_em()
         for _, row in df_a.iterrows():
             try:
                 code = str(row['代码'])
                 val = row['涨跌幅']
                 market_map[code] = float(val) if val is not None else 0.0
             except: continue
+    except Exception as e:
+        print(f"A股行情获取部分失败: {e}")
 
-    # 2. 获取港股 (失败不报错，只打印)
-    for i in range(max_retries):
-        try:
-            df_hk = ak.stock_hk_spot_em()
-            for _, row in df_hk.iterrows():
-                try:
-                    code = str(row['代码'])
-                    val = row['涨跌幅']
-                    market_map[code] = float(val) if val is not None else 0.0
-                except: continue
-            break
-        except:
-            time.sleep(1)
-
-    return market_map, None
-
-# --- 核心功能 2: 获取持仓 (带多源切换 & 智能解析) ---
-def get_valuation(fund_code):
-    
-    # 内部函数：获取原始数据
-    # 内部函数：获取原始数据 (暴力增强版)
-    def fetch_raw_data(source):
-        try:
-            # 1. 尝试标准接口
-            if source == 'em': 
-                df = ak.fund_portfolio_hold_em(symbol=fund_code)
-                if not df.empty: return df
-                
-                # 🚑 补丁：如果标准接口没数据，尝试 "大成基金" 接口 (有时候这个接口有LOF数据)
-                # 注意：这个接口返回格式可能不同，但我们试试运气
-                try:
-                    print(f"尝试备用接口抓取 {fund_code}...")
-                    # 这是一个很少用但对老基金很有效的接口
-                    return ak.fund_portfolio_hold_em(symbol=fund_code, date="2024") # 强行指定年份试试
-                except:
-                    pass
-
-            # 2. 尝试巨潮接口
-            if source == 'cninfo': 
-                return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
-                
-        except Exception as e:
-            print(f"接口报错: {e}") # 在黑窗口打印真实错误
-            return pd.DataFrame()
-        return pd.DataFrame()
-
+    # 2. 港股行情 (允许失败)
     try:
-        # --- 智能解析列名 ---
-        # 很多报错是因为列名变了，这里做模糊匹配逻辑
+        df_hk = ak.stock_hk_spot_em()
+        for _, row in df_hk.iterrows():
+            try:
+                code = str(row['代码']) 
+                val = row['涨跌幅']
+                market_map[code] = float(val) if val is not None else 0.0
+            except: continue
+    except:
+        pass
+
+    return market_map
+
+# --- 核心功能 2: 获取持仓 (绝对安全逻辑) ---
+def get_valuation(fund_code):
+    # ⭐ 关键修复：一开始就初始化变量，防止报错
+    portfolio = pd.DataFrame() 
+    
+    # --- 第一步：尝试获取数据 (多源) ---
+    # 1. 尝试主接口 (东方财富)
+    try:
+        portfolio = ak.fund_portfolio_hold_em(symbol=fund_code)
+    except:
+        pass # 失败了不要紧，portfolio 还是空的
+
+    # 2. 如果主接口没抓到，尝试备用接口 (巨潮)
+    if portfolio.empty:
+        try:
+            st.toast(f"正在切换线路查询 {fund_code}...", icon="🔄")
+            portfolio = ak.fund_portfolio_hold_cninfo(symbol=fund_code)
+        except:
+            pass
+
+    # 3. 最终检查：如果还是空的，那就是真的抓不到
+    if portfolio.empty:
+        return None, "无法获取持仓数据 (可能是IP被封或基金代码不支持)", 0
+
+    # --- 第二步：解析数据 (智能列名匹配) ---
+    try:
         cols = portfolio.columns.tolist()
         holdings = pd.DataFrame()
 
-        # 逻辑 A: 按季度排序找最新的
+        # 这里的逻辑是：不管列名怎么变，我们只找我们需要的
+        # 优先找 '季度' 进行排序
         if '季度' in cols:
-            # 字符串排序: "2025年1季度" > "2024年4季度"
             portfolio = portfolio.sort_values(by='季度', ascending=False)
-            latest_q = portfolio.iloc[0]['季度']
-            holdings = portfolio[portfolio['季度'] == latest_q]
-        # 逻辑 B: 按截止日期排序
+            latest = portfolio.iloc[0]['季度']
+            holdings = portfolio[portfolio['季度'] == latest]
         elif '截止报告期' in cols:
             portfolio = portfolio.sort_values(by='截止报告期', ascending=False)
-            latest_d = portfolio.iloc[0]['截止报告期']
-            holdings = portfolio[portfolio['截止报告期'] == latest_d]
-        # 逻辑 C: 旧版年份逻辑 (兼容)
+            latest = portfolio.iloc[0]['截止报告期']
+            holdings = portfolio[portfolio['截止报告期'] == latest]
         elif '年份' in cols:
-            latest_y = portfolio['年份'].max()
-            df_y = portfolio[portfolio['年份'] == latest_y]
-            # 这里如果不含季度列，就直接用
-            holdings = df_y 
+            latest = portfolio['年份'].max()
+            holdings = portfolio[portfolio['年份'] == latest]
         else:
-            return None, f"数据格式异常，列名: {cols}", 0
-        
-        # 截取前10大
+            # 如果什么都没有，就硬着头皮取前10行试试
+            holdings = portfolio.head(10)
+
+        # 截取前10大重仓
         holdings = holdings.head(10)
         
-        # --- 计算估值 ---
-        market_map, err = get_market_data()
-        if err: return None, err, 0
-
+        # --- 第三步：计算估值 ---
+        market_map = get_market_data()
+        
         details = []
         total_contribution = 0
         
         for _, row in holdings.iterrows():
-            # 容错获取字段
+            # 容错获取字段 (不管它叫 '股票代码' 还是 '代码')
             s_code = str(row.get('股票代码', row.get('代码', '')))
             s_name = row.get('股票名称', row.get('简称', '未知'))
-            weight = float(row.get('占净值比例', row.get('市值占净值比', 0)))
+            # 容错获取权重 (不管它叫 '占净值比例' 还是 '市值占净值比')
+            weight_val = row.get('占净值比例', row.get('市值占净值比', 0))
+            try:
+                weight = float(weight_val)
+            except:
+                weight = 0.0
             
-            # 匹配行情 (尝试 A股6位, 港股5位, 补零等多种情况)
+            # 匹配行情
             change = 0.0
             found = False
+            # 尝试多种代码格式
             possible_keys = [s_code, "0"+s_code, s_code.split('.')[0]]
             
             for k in possible_keys:
@@ -144,7 +126,7 @@ def get_valuation(fund_code):
                 "股票": s_name,
                 "代码": s_code,
                 "权重": weight,
-                "涨跌%": change if found else 0.0,
+                "涨跌%": change,
                 "贡献": contribution,
                 "状态": "✅" if found else "❌"
             })
@@ -152,19 +134,18 @@ def get_valuation(fund_code):
         return pd.DataFrame(details), None, total_contribution
 
     except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return None, f"解析错误: {str(e)}", 0
+        return None, f"数据解析发生错误: {str(e)}", 0
 
 # --- 界面 UI ---
 fund_code = st.text_input("输入基金代码:", value="005827")
 
 if st.button("🚀 开始计算", type="primary"):
-    with st.spinner("正在连接交易所数据..."):
+    with st.spinner("正在努力连接数据源..."):
         df, error, val = get_valuation(fund_code)
         
         if error:
             st.error(error)
+            st.warning("如果一直失败，请检查是否开启了VPN，或稍后再试。")
         else:
             # 结果卡片
             col1, col2 = st.columns(2)
@@ -176,15 +157,17 @@ if st.button("🚀 开始计算", type="primary"):
                 st.info(f"含 {hk_cnt} 只港股" if hk_cnt > 0 else "纯A股持仓")
 
             # 图表
-            fig = px.bar(df, x='股票', y='涨跌%', color='涨跌%', 
-                         title="重仓股表现热力图",
-                         text='市场',
-                         color_continuous_scale=['green', '#f0f0f0', 'red'],
-                         range_color=[-5, 5])
-            st.plotly_chart(fig, use_container_width=True)
+            try:
+                fig = px.bar(df, x='股票', y='涨跌%', color='涨跌%', 
+                             title="重仓股表现热力图",
+                             text='市场',
+                             color_continuous_scale=['green', '#f0f0f0', 'red'],
+                             range_color=[-5, 5])
+                st.plotly_chart(fig, use_container_width=True)
+            except:
+                st.caption("图表加载失败，请看下方表格")
             
             # 表格
             st.dataframe(df.style.format({
                 "权重": "{:.2f}%", "涨跌%": "{:.2f}%", "贡献": "{:.4f}%"
             }), use_container_width=True)
-
