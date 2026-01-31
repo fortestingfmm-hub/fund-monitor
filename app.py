@@ -2,190 +2,179 @@ import streamlit as st
 import akshare as ak
 import pandas as pd
 import plotly.express as px
+import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="高级基金估值(含港股)", page_icon="🌏")
-st.title("🌏 基金实时估值 (A股+港股版)")
-st.caption("支持：沪深A股、港股 | 数据源：东方财富 | 延迟：约 1-3 分钟")
+st.set_page_config(page_title="基金实时估值终极版", page_icon="🚀", layout="centered")
+st.title("🚀 基金实时估值 (抗网络波动版)")
+st.caption("支持：LOF/混合/股票型 | A股+港股 | 自动重试机制")
 
-# --- 核心逻辑 ---
-
-@st.cache_data(ttl=60) # 缓存60秒，防止频繁请求卡顿
+# --- 核心功能 1: 获取行情 (带自动重试) ---
+@st.cache_data(ttl=60)
 def get_market_data():
-    """一次性获取全市场A股和港股数据，并建立查找表"""
+    """获取全市场行情，带断线重连机制"""
     market_map = {}
+    max_retries = 3
     
-    try:
-        # 1. 获取A股实时行情
-        df_a = ak.stock_zh_a_spot_em()
-        # 建立 A股 字典：{代码: 涨跌幅}
-        for _, row in df_a.iterrows():
-            code = str(row['代码'])
-            change = float(row['涨跌幅'])
-            market_map[code] = change
-            
-        # 2. 获取港股实时行情
-        df_hk = ak.stock_hk_spot_em()
-        # 建立 港股 字典：{代码: 涨跌幅}
-        # 港股接口返回的代码通常是 5位 (e.g., "00700")
-        for _, row in df_hk.iterrows():
-            code = str(row['代码']) 
-            change = float(row['涨跌幅'])
-            market_map[code] = change
-            
-        return market_map, None
-    except Exception as e:
-        return {}, str(e)
-
-def get_valuation(fund_code):
-    # --- 内部函数：尝试获取数据 ---
-    def fetch_data(source_type):
+    # 1. 获取 A 股
+    df_a = pd.DataFrame()
+    for i in range(max_retries):
         try:
-            if source_type == "em": 
-                # 注意：这里务必使用 symbol=fund_code
-                return ak.fund_portfolio_hold_em(symbol=fund_code)
-            elif source_type == "cninfo": 
-                return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
-        except:
-            return pd.DataFrame() 
+            df_a = ak.stock_zh_a_spot_em()
+            break
+        except Exception as e:
+            if i < max_retries - 1:
+                print(f"A股行情重试 {i+1}...")
+                time.sleep(1)
+            else:
+                return {}, f"网络连接失败，请关闭VPN后重试: {str(e)}"
 
-    # 1. 获取数据
-    portfolio = fetch_data("em")
-    if portfolio.empty:
-        st.toast(f"东方财富源无数据，尝试巨潮源...", icon="🔄")
-        portfolio = fetch_data("cninfo")
+    if not df_a.empty:
+        for _, row in df_a.iterrows():
+            try:
+                code = str(row['代码'])
+                val = row['涨跌幅']
+                market_map[code] = float(val) if val is not None else 0.0
+            except: continue
+
+    # 2. 获取港股 (失败不报错，只打印)
+    for i in range(max_retries):
+        try:
+            df_hk = ak.stock_hk_spot_em()
+            for _, row in df_hk.iterrows():
+                try:
+                    code = str(row['代码'])
+                    val = row['涨跌幅']
+                    market_map[code] = float(val) if val is not None else 0.0
+                except: continue
+            break
+        except:
+            time.sleep(1)
+
+    return market_map, None
+
+# --- 核心功能 2: 获取持仓 (带多源切换 & 智能解析) ---
+def get_valuation(fund_code):
     
+    # 内部函数：获取原始数据
+    def fetch_raw_data(source):
+        try:
+            if source == 'em': return ak.fund_portfolio_hold_em(symbol=fund_code)
+            if source == 'cninfo': return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
+        except: return pd.DataFrame()
+
+    # 1. 尝试主源 (东方财富)
+    portfolio = fetch_raw_data('em')
+    
+    # 2. 尝试备用源 (巨潮)
     if portfolio.empty:
-        return None, "未找到持仓数据 (请确认基金代码正确)", 0
+        st.toast(f"主线路忙，切换备用线路查询 {fund_code}...", icon="🔄")
+        portfolio = fetch_raw_data('cninfo')
+
+    if portfolio.empty:
+        return None, "未找到持仓数据 (请检查代码或网络)", 0
 
     try:
-        # --- 🔍 核心修复：智能识别列名 ---
-        # 打印一下列名，方便调试 (在CMD窗口可以看到)
-        print(f"Debug: 抓取到的列名: {portfolio.columns.tolist()}")
-
+        # --- 智能解析列名 ---
+        # 很多报错是因为列名变了，这里做模糊匹配逻辑
+        cols = portfolio.columns.tolist()
         holdings = pd.DataFrame()
-        
-        # 情况 A: 如果有 '年份' 和 '季度' 列 (旧格式)
-        if '年份' in portfolio.columns and '季度' in portfolio.columns:
-            portfolio['年份'] = portfolio['年份'].astype(str)
-            latest_year = portfolio['年份'].max()
-            df_year = portfolio[portfolio['年份'] == latest_year]
-            latest_quarter = df_year['季度'].max()
-            holdings = df_year[df_year['季度'] == latest_quarter]
 
-        # 情况 B: 如果只有 '季度' 列 (新格式, 例如 "2024年3季度")
-        elif '季度' in portfolio.columns:
-            # 字符串排序: "2024年3季度" > "2023年4季度"，所以直接降序排
+        # 逻辑 A: 按季度排序找最新的
+        if '季度' in cols:
+            # 字符串排序: "2025年1季度" > "2024年4季度"
             portfolio = portfolio.sort_values(by='季度', ascending=False)
-            # 取第一行的季度作为最新季度
-            latest_q_str = portfolio.iloc[0]['季度']
-            # 筛选出所有属于该季度的数据
-            holdings = portfolio[portfolio['季度'] == latest_q_str]
-            
-        # 情况 C: 只有 '截止报告期' (巨潮源常见)
-        elif '截止报告期' in portfolio.columns:
-             portfolio = portfolio.sort_values(by='截止报告期', ascending=False)
-             latest_date = portfolio.iloc[0]['截止报告期']
-             holdings = portfolio[portfolio['截止报告期'] == latest_date]
-        
+            latest_q = portfolio.iloc[0]['季度']
+            holdings = portfolio[portfolio['季度'] == latest_q]
+        # 逻辑 B: 按截止日期排序
+        elif '截止报告期' in cols:
+            portfolio = portfolio.sort_values(by='截止报告期', ascending=False)
+            latest_d = portfolio.iloc[0]['截止报告期']
+            holdings = portfolio[portfolio['截止报告期'] == latest_d]
+        # 逻辑 C: 旧版年份逻辑 (兼容)
+        elif '年份' in cols:
+            latest_y = portfolio['年份'].max()
+            df_y = portfolio[portfolio['年份'] == latest_y]
+            # 这里如果不含季度列，就直接用
+            holdings = df_y 
         else:
-            return None, f"无法识别的数据格式，列名: {portfolio.columns.tolist()}", 0
-
-        # 取前10大重仓 (防止数据源返回全部持仓)
+            return None, f"数据格式异常，列名: {cols}", 0
+        
+        # 截取前10大
         holdings = holdings.head(10)
-
-        # --- 下面是通用的计算逻辑 ---
+        
+        # --- 计算估值 ---
         market_map, err = get_market_data()
-        if err: return None, f"行情失败: {err}", 0
+        if err: return None, err, 0
 
         details = []
         total_contribution = 0
         
         for _, row in holdings.iterrows():
-            # 兼容不同接口的列名 (有的叫'股票代码', 有的叫'代码')
-            stock_code = str(row.get('股票代码', row.get('代码', '')))
-            stock_name = row.get('股票名称', row.get('简称', '未知'))
-            # 兼容权重列名 (有的叫'占净值比例', 有的叫'市值占净值比')
+            # 容错获取字段
+            s_code = str(row.get('股票代码', row.get('代码', '')))
+            s_name = row.get('股票名称', row.get('简称', '未知'))
             weight = float(row.get('占净值比例', row.get('市值占净值比', 0)))
             
-            # 匹配行情
-            current_change = 0.0
+            # 匹配行情 (尝试 A股6位, 港股5位, 补零等多种情况)
+            change = 0.0
             found = False
+            possible_keys = [s_code, "0"+s_code, s_code.split('.')[0]]
             
-            # 尝试直接匹配 / 补零匹配 / 去后缀匹配
-            keys_to_try = [stock_code, "0"+stock_code, stock_code.split('.')[0]]
-            
-            for k in keys_to_try:
+            for k in possible_keys:
                 if k in market_map:
-                    current_change = market_map[k]
+                    change = market_map[k]
                     found = True
                     break
             
-            contribution = current_change * (weight / 100)
+            contribution = change * (weight / 100)
             total_contribution += contribution
             
-            market_type = "🇭🇰" if len(stock_code) == 5 else "🇨🇳"
-            
             details.append({
-                "市场": market_type,
-                "股票名称": stock_name,
-                "代码": stock_code,
+                "市场": "🇭🇰" if len(s_code)==5 else "🇨🇳",
+                "股票": s_name,
+                "代码": s_code,
                 "权重": weight,
-                "今日涨跌%": current_change if found else 0.0,
-                "贡献度": contribution
+                "涨跌%": change if found else 0.0,
+                "贡献": contribution,
+                "状态": "✅" if found else "❌"
             })
             
         return pd.DataFrame(details), None, total_contribution
 
     except Exception as e:
         import traceback
-        traceback.print_exc() # 在CMD打印详细报错
-        return None, f"数据解析错误: {str(e)}", 0
+        traceback.print_exc()
+        return None, f"解析错误: {str(e)}", 0
 
-# --- 界面交互 ---
+# --- 界面 UI ---
+fund_code = st.text_input("输入基金代码:", value="005827")
 
-default_code = "005827" # 易方达蓝筹 (典型含港股基金)
-fund_code = st.text_input("输入基金代码:", value=default_code)
-
-if st.button("开始计算", type="primary"):
-    with st.spinner('正在连接 A股 和 港股 交易所...'):
-        df, error_msg, estimate = get_valuation(fund_code)
+if st.button("🚀 开始计算", type="primary"):
+    with st.spinner("正在连接交易所数据..."):
+        df, error, val = get_valuation(fund_code)
         
-        if error_msg:
-            st.error(error_msg)
+        if error:
+            st.error(error)
         else:
-            # 结果展示区
+            # 结果卡片
             col1, col2 = st.columns(2)
-            
             with col1:
-                color = "red" if estimate > 0 else "green"
-                st.metric("估算净值涨跌", f"{estimate:.2f}%")
-            
+                color = "red" if val > 0 else "green"
+                st.metric("估算净值涨跌", f"{val:.2f}%")
             with col2:
-                # 统计一下含多少港股
-                hk_count = len(df[df['市场'].str.contains("港")])
-                st.info(f"前十大重仓中包含 {hk_count} 只港股")
+                hk_cnt = len(df[df['市场']=="🇭🇰"])
+                st.info(f"含 {hk_cnt} 只港股" if hk_cnt > 0 else "纯A股持仓")
 
-            st.caption("注：港股涨跌未计算汇率波动，仅做近似参考。")
-            
-            # 漂亮的表格
-            st.dataframe(
-                df.style.format({
-                    "权重": "{:.2f}%", 
-                    "今日涨跌%": "{:.2f}%", 
-                    "贡献度": "{:.4f}%"
-                }).background_gradient(subset=['今日涨跌%'], cmap='RdYlGn_r', vmin=-3, vmax=3),
-                use_container_width=True
-            )
-            
-            # 柱状图
-            fig = px.bar(df, x='股票名称', y='今日涨跌%', 
-                         color='今日涨跌%', 
+            # 图表
+            fig = px.bar(df, x='股票', y='涨跌%', color='涨跌%', 
+                         title="重仓股表现热力图",
                          text='市场',
-                         title="重仓股涨跌幅 (含港股)",
                          color_continuous_scale=['green', '#f0f0f0', 'red'],
                          range_color=[-5, 5])
-
             st.plotly_chart(fig, use_container_width=True)
-
-
+            
+            # 表格
+            st.dataframe(df.style.format({
+                "权重": "{:.2f}%", "涨跌%": "{:.2f}%", "贡献": "{:.4f}%"
+            }), use_container_width=True)
