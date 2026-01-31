@@ -7,19 +7,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- 页面配置 ---
 st.set_page_config(page_title="极速基金估值", page_icon="⚡", layout="wide")
-st.title("⚡ 基金实时估值 (极速多线程版)")
-st.caption("多线程并发 | 速度提升300% | 自动重试")
+st.title("⚡ 基金实时估值 (轻量稳定版)")
+st.caption("多线程并发 | 纯CSS渲染 | 彻底修复ImportError")
 
 # --- 核心功能 1: 获取全市场行情 (带缓存) ---
-# 这个函数很重，必须缓存，且不能多线程（因为是一次性拉取）
 @st.cache_data(ttl=60)
 def get_market_data():
     market_map = {}
-    
     # 1. A股
     for i in range(3):
         try:
-            # 获取全市场A股实时行情
             df_a = ak.stock_zh_a_spot_em()
             for _, row in df_a.iterrows():
                 try:
@@ -42,12 +39,10 @@ def get_market_data():
                 except: continue
             break
         except: time.sleep(1)
-
     return market_map
 
-# --- 核心功能 2: 计算单个基金 (独立封装，方便给线程调用) ---
+# --- 核心功能 2: 计算单个基金 ---
 def calculate_single_fund(fund_code, market_map):
-    
     # 内部函数：安全的获取数据
     def try_fetch(source, specific_year=None):
         try:
@@ -61,7 +56,7 @@ def calculate_single_fund(fund_code, market_map):
                     else: return pd.DataFrame()
         except: return pd.DataFrame()
 
-    # 1. 获取数据 (梯队式挖掘，专治 LOF 缺数据)
+    # 1. 获取数据
     portfolio = try_fetch('em') 
     if portfolio.empty: portfolio = try_fetch('em', specific_year=2025)
     if portfolio.empty: portfolio = try_fetch('em', specific_year=2024)
@@ -150,7 +145,7 @@ def calculate_single_fund(fund_code, market_map):
 
 with st.sidebar:
     st.header("⚡ 控制台")
-    default_text = "005827\n161226\n110011\n000001\n510300"
+    default_text = "005827\n161226\n110011\n000001"
     codes_input = st.text_area("基金代码池", value=default_text, height=150)
     fund_codes = [line.strip() for line in codes_input.split('\n') if line.strip()]
     
@@ -164,7 +159,28 @@ with st.sidebar:
         st.cache_data.clear()
         st.toast("缓存已清空", icon="🧹")
 
-# --- 主逻辑：引入线程池 ---
+# --- 样式函数 (纯Python实现，不依赖matplotlib) ---
+def style_negative_positive(val):
+    """
+    手动实现背景色：
+    涨(>0) -> 浅红背景
+    跌(<0) -> 浅绿背景
+    """
+    if not isinstance(val, (int, float)): return ''
+    if val > 0:
+        return 'background-color: #ffcdd2; color: black' # 浅红
+    elif val < 0:
+        return 'background-color: #c8e6c9; color: black' # 浅绿
+    return ''
+
+def style_text_color(val):
+    """文字颜色：红涨绿跌"""
+    if not isinstance(val, (int, float)): return ''
+    color = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
+    return f'color: {color}; font-weight: bold'
+
+
+# --- 主逻辑 ---
 if refresh or force_refresh or 'data_cache' not in st.session_state:
     if not fund_codes:
         st.warning("请在左侧添加代码")
@@ -172,29 +188,20 @@ if refresh or force_refresh or 'data_cache' not in st.session_state:
         progress = st.progress(0)
         status = st.empty()
         
-        # 1. 获取全市场行情 (这是唯一需要等待的“重”操作)
         with st.spinner("正在拉取全市场数据..."):
             market_map = get_market_data()
         
         results = []
-        
-        # 2. 多线程并发计算 (核心优化点)
         status.text("🚀 正在多线程并发计算...")
         
-        # max_workers=4 是一个比较安全的数值，既快又不容易被封
         with ThreadPoolExecutor(max_workers=4) as executor:
-            # 提交所有任务
             future_to_code = {executor.submit(calculate_single_fund, code, market_map): code for code in fund_codes}
-            
-            # 任务一个个完成时，更新进度条
             for i, future in enumerate(as_completed(future_to_code)):
                 res = future.result()
                 results.append(res)
-                # 更新进度条
                 progress.progress((i + 1) / len(fund_codes))
         
-        # 保持原来的顺序 (因为多线程返回顺序是乱的)
-        # 我们根据输入的 codes 顺序重新排一下
+        # 重新排序
         final_results = []
         res_dict = {r['代码']: r for r in results}
         for code in fund_codes:
@@ -211,12 +218,10 @@ if 'data_cache' in st.session_state:
     df_res = pd.DataFrame(results)
     
     st.subheader("⚡ 极速估值表")
-    def color_val(val):
-        c = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
-        return f'color: {c}; font-weight: bold'
-
+    
+    # 应用文字颜色样式
     st.dataframe(
-        df_res[['代码', '名称', '估值', '状态']].style.applymap(color_val, subset=['估值'])
+        df_res[['代码', '名称', '估值', '状态']].style.applymap(style_text_color, subset=['估值'])
                     .format({"估值": "{:+.2f}%"}),
         use_container_width=True,
         hide_index=True
@@ -239,10 +244,15 @@ if 'data_cache' in st.session_state:
         c2.metric("估值", f"{target_data['估值']:.2f}%", delta_color="normal")
         c3.metric("港股", f"{target_data['港股含量']} 只")
         
+        # ⚠️ 关键修改：这里不再用 background_gradient，改用自定义的 style_negative_positive
+        # 这样就完全移除了对 matplotlib 的依赖
         st.dataframe(
-            target_data['明细'].style.format({
-                "权重": "{:.2f}%", "今日涨跌%": "{:.2f}%", "贡献度": "{:.4f}%"
-            }).background_gradient(subset=['今日涨跌%'], cmap='RdYlGn_r', vmin=-5, vmax=5),
+            target_data['明细'].style
+                .applymap(style_negative_positive, subset=['今日涨跌%']) # 使用背景色
+                .applymap(style_text_color, subset=['贡献度']) # 使用文字色
+                .format({
+                    "权重": "{:.2f}%", "今日涨跌%": "{:.2f}%", "贡献度": "{:.4f}%"
+                }),
             use_container_width=True,
             hide_index=True
         )
