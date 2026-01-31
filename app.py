@@ -41,70 +41,90 @@ def get_valuation(fund_code):
     # --- 内部函数：尝试获取数据 ---
     def fetch_data(source_type):
         try:
-            if source_type == "em": # 东方财富接口
+            if source_type == "em": 
+                # 注意：这里务必使用 symbol=fund_code
                 return ak.fund_portfolio_hold_em(symbol=fund_code)
-            elif source_type == "cninfo": # 巨潮资讯接口 (备用)
+            elif source_type == "cninfo": 
                 return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
         except:
-            return pd.DataFrame() # 出错返回空表
-            
-    # 1. 尝试主接口 (东方财富)
+            return pd.DataFrame() 
+
+    # 1. 获取数据
     portfolio = fetch_data("em")
-    
-    # 2. 如果主接口没数据，尝试备用接口 (巨潮资讯)
     if portfolio.empty:
-        # st.toast 会在右上角弹个小提示，告诉你切换了数据源
-        st.toast(f"东方财富无数据，正在切换至巨潮资讯源查询 {fund_code}...", icon="🔄")
+        st.toast(f"东方财富源无数据，尝试巨潮源...", icon="🔄")
         portfolio = fetch_data("cninfo")
     
-    # 3. 如果还是空，那就真的没救了
     if portfolio.empty:
-        return None, "未找到持仓数据 (可能因基金类型特殊或云端IP被拦截)", 0
+        return None, "未找到持仓数据 (请确认基金代码正确)", 0
 
     try:
-        # 数据清洗：确保年份是数字
-        portfolio['年份'] = portfolio['年份'].astype(str).astype(int)
+        # --- 🔍 核心修复：智能识别列名 ---
+        # 打印一下列名，方便调试 (在CMD窗口可以看到)
+        print(f"Debug: 抓取到的列名: {portfolio.columns.tolist()}")
+
+        holdings = pd.DataFrame()
         
-        # 筛选最新季度
-        latest_year = portfolio['年份'].max()
-        df_year = portfolio[portfolio['年份'] == latest_year]
-        latest_quarter = df_year['季度'].max()
-        holdings = df_year[df_year['季度'] == latest_quarter].head(10)
+        # 情况 A: 如果有 '年份' 和 '季度' 列 (旧格式)
+        if '年份' in portfolio.columns and '季度' in portfolio.columns:
+            portfolio['年份'] = portfolio['年份'].astype(str)
+            latest_year = portfolio['年份'].max()
+            df_year = portfolio[portfolio['年份'] == latest_year]
+            latest_quarter = df_year['季度'].max()
+            holdings = df_year[df_year['季度'] == latest_quarter]
+
+        # 情况 B: 如果只有 '季度' 列 (新格式, 例如 "2024年3季度")
+        elif '季度' in portfolio.columns:
+            # 字符串排序: "2024年3季度" > "2023年4季度"，所以直接降序排
+            portfolio = portfolio.sort_values(by='季度', ascending=False)
+            # 取第一行的季度作为最新季度
+            latest_q_str = portfolio.iloc[0]['季度']
+            # 筛选出所有属于该季度的数据
+            holdings = portfolio[portfolio['季度'] == latest_q_str]
+            
+        # 情况 C: 只有 '截止报告期' (巨潮源常见)
+        elif '截止报告期' in portfolio.columns:
+             portfolio = portfolio.sort_values(by='截止报告期', ascending=False)
+             latest_date = portfolio.iloc[0]['截止报告期']
+             holdings = portfolio[portfolio['截止报告期'] == latest_date]
         
-        # 获取最新的市场数据
+        else:
+            return None, f"无法识别的数据格式，列名: {portfolio.columns.tolist()}", 0
+
+        # 取前10大重仓 (防止数据源返回全部持仓)
+        holdings = holdings.head(10)
+
+        # --- 下面是通用的计算逻辑 ---
         market_map, err = get_market_data()
-        if err:
-            return None, f"行情获取失败: {err}", 0
+        if err: return None, f"行情失败: {err}", 0
 
         details = []
         total_contribution = 0
-        total_weight = 0
         
         for _, row in holdings.iterrows():
-            stock_code = str(row['股票代码'])
-            stock_name = row['股票名称']
-            weight = float(row['占净值比例'])
+            # 兼容不同接口的列名 (有的叫'股票代码', 有的叫'代码')
+            stock_code = str(row.get('股票代码', row.get('代码', '')))
+            stock_name = row.get('股票名称', row.get('简称', '未知'))
+            # 兼容权重列名 (有的叫'占净值比例', 有的叫'市值占净值比')
+            weight = float(row.get('占净值比例', row.get('市值占净值比', 0)))
             
-            # --- 核心匹配逻辑 ---
+            # 匹配行情
             current_change = 0.0
             found = False
             
-            # 尝试直接匹配
-            if stock_code in market_map:
-                current_change = market_map[stock_code]
-                found = True
-            # 尝试补零匹配 (防止数据源格式不一致)
-            elif len(stock_code) == 5 and ("0" + stock_code) in market_map: 
-                 current_change = market_map["0" + stock_code]
-                 found = True
+            # 尝试直接匹配 / 补零匹配 / 去后缀匹配
+            keys_to_try = [stock_code, "0"+stock_code, stock_code.split('.')[0]]
             
-            # 计算贡献
+            for k in keys_to_try:
+                if k in market_map:
+                    current_change = market_map[k]
+                    found = True
+                    break
+            
             contribution = current_change * (weight / 100)
             total_contribution += contribution
-            total_weight += weight
             
-            # 标记一下是哪里的股票
-            market_type = "🇭🇰 港" if len(stock_code) == 5 else "🇨🇳 A"
+            market_type = "🇭🇰" if len(stock_code) == 5 else "🇨🇳"
             
             details.append({
                 "市场": market_type,
@@ -112,14 +132,15 @@ def get_valuation(fund_code):
                 "代码": stock_code,
                 "权重": weight,
                 "今日涨跌%": current_change if found else 0.0,
-                "贡献度": contribution,
-                "状态": "✅" if found else "❌无数据"
+                "贡献度": contribution
             })
             
         return pd.DataFrame(details), None, total_contribution
 
     except Exception as e:
-        return None, str(e), 0
+        import traceback
+        traceback.print_exc() # 在CMD打印详细报错
+        return None, f"数据解析错误: {str(e)}", 0
 
 # --- 界面交互 ---
 
@@ -166,4 +187,5 @@ if st.button("开始计算", type="primary"):
                          range_color=[-5, 5])
 
             st.plotly_chart(fig, use_container_width=True)
+
 
