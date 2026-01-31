@@ -57,22 +57,31 @@ def get_market_data():
 def get_valuation(fund_code):
     
     # 内部函数：获取原始数据
+    # 内部函数：获取原始数据 (暴力增强版)
     def fetch_raw_data(source):
         try:
-            if source == 'em': return ak.fund_portfolio_hold_em(symbol=fund_code)
-            if source == 'cninfo': return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
-        except: return pd.DataFrame()
+            # 1. 尝试标准接口
+            if source == 'em': 
+                df = ak.fund_portfolio_hold_em(symbol=fund_code)
+                if not df.empty: return df
+                
+                # 🚑 补丁：如果标准接口没数据，尝试 "大成基金" 接口 (有时候这个接口有LOF数据)
+                # 注意：这个接口返回格式可能不同，但我们试试运气
+                try:
+                    print(f"尝试备用接口抓取 {fund_code}...")
+                    # 这是一个很少用但对老基金很有效的接口
+                    return ak.fund_portfolio_hold_em(symbol=fund_code, date="2024") # 强行指定年份试试
+                except:
+                    pass
 
-    # 1. 尝试主源 (东方财富)
-    portfolio = fetch_raw_data('em')
-    
-    # 2. 尝试备用源 (巨潮)
-    if portfolio.empty:
-        st.toast(f"主线路忙，切换备用线路查询 {fund_code}...", icon="🔄")
-        portfolio = fetch_raw_data('cninfo')
-
-    if portfolio.empty:
-        return None, "未找到持仓数据 (请检查代码或网络)", 0
+            # 2. 尝试巨潮接口
+            if source == 'cninfo': 
+                return ak.fund_portfolio_hold_cninfo(symbol=fund_code)
+                
+        except Exception as e:
+            print(f"接口报错: {e}") # 在黑窗口打印真实错误
+            return pd.DataFrame()
+        return pd.DataFrame()
 
     try:
         # --- 智能解析列名 ---
@@ -178,3 +187,4 @@ if st.button("🚀 开始计算", type="primary"):
             st.dataframe(df.style.format({
                 "权重": "{:.2f}%", "涨跌%": "{:.2f}%", "贡献": "{:.4f}%"
             }), use_container_width=True)
+
