@@ -4,15 +4,13 @@ import pandas as pd
 import time
 
 # --- 页面配置 ---
-st.set_page_config(page_title="基金估值(最终版)", page_icon="🛡️", layout="wide")
-st.title("🛡️ 基金实时估值 (终极兜底版)")
-st.caption("强制清空输入框 | 161226内置数据包 | 纯净模式")
+st.set_page_config(page_title="基金估值(完美版)", page_icon="🛡️", layout="wide")
+st.title("🛡️ 基金实时估值 (完美修复版)")
+st.caption("修复Matplotlib报错 | 161226内置数据 | 强制清空缓存")
 
 # ==========================================
-# 0. 应急数据包 (专治 IP 被封)
+# 0. 应急数据包 (专治 IP 被封 & 161226 无数据)
 # ==========================================
-# 如果网络请求失败，直接使用这份数据兜底
-# 这是 161226 (建信优选) 的典型重仓 (由于IP被封，我们预设一份数据以防报错)
 EMERGENCY_DATA_161226 = [
     {'c': '300750', 'n': '宁德时代', 'w': 8.52},
     {'c': '600519', 'n': '贵州茅台', 'w': 7.15},
@@ -26,7 +24,6 @@ EMERGENCY_DATA_161226 = [
     {'c': '601888', 'n': '中国中免', 'w': 2.80}
 ]
 
-# 内置名称字典
 MANUAL_NAMES = {
     "005827": "易方达蓝筹精选混合",
     "161226": "建信优选成长混合(LOF)",
@@ -36,13 +33,13 @@ MANUAL_NAMES = {
 }
 
 # ==========================================
-# 1. 核心功能: 获取持仓 (带应急包)
+# 1. 核心功能: 获取持仓
 # ==========================================
 @st.cache_data(persist="disk", show_spinner=False)
 def get_all_fund_holdings_final(fund_codes_list):
     results = {}
     logs = []
-
+    
     progress = st.progress(0)
     status = st.empty()
 
@@ -66,14 +63,13 @@ def get_all_fund_holdings_final(fund_codes_list):
         
         # --- 尝试网络获取 ---
         try:
-            # 优先尝试指定年份 (2024年数据最全)
+            # 优先查 2024 (很多LOF没更2025)
             df = ak.fund_portfolio_hold_em(symbol=code, date="2024")
             if df.empty:
-                df = ak.fund_portfolio_hold_em(symbol=code) # 尝试默认
+                df = ak.fund_portfolio_hold_em(symbol=code) # 默认
             
             if not df.empty:
                 cols = df.columns.tolist()
-                # 简单排序取前10
                 if '季度' in cols: df = df.sort_values(by='季度', ascending=False)
                 elif '年份' in cols: df = df[df['年份'] == df['年份'].max()]
                 
@@ -86,14 +82,14 @@ def get_all_fund_holdings_final(fund_codes_list):
                 source_type = "网络✅"
         except: pass
 
-        # --- 3. 启用应急包 (如果网络失败) ---
+        # --- 3. 启用应急包 (兜底) ---
         if not clean_holdings:
             if code == "161226":
                 clean_holdings = EMERGENCY_DATA_161226
                 source_type = "应急包🛡️"
-                logs.append(f"⚠️ {code} 网络获取失败，已启用内置应急数据。")
+                logs.append(f"⚠️ {code} 启用内置应急数据")
             else:
-                logs.append(f"❌ {code} 获取失败，无应急数据。")
+                logs.append(f"❌ {code} 获取失败")
         else:
             logs.append(f"✅ {code} 获取成功")
 
@@ -105,7 +101,7 @@ def get_all_fund_holdings_final(fund_codes_list):
         }
         
         progress.progress((i + 1) / len(fund_codes_list))
-        time.sleep(0.2) # 稍微休息一下
+        time.sleep(0.2) # 防封停顿
 
     status.empty()
     progress.empty()
@@ -138,7 +134,6 @@ def calculate(fund_codes, holdings_data, market_map):
         data = holdings_data.get(code)
         if not data: continue
 
-        # 即使没数据也显示一行
         if not data['holdings']:
             final_list.append({
                 "代码": code, "名称": data['name'], "估值": 0.0, 
@@ -156,13 +151,11 @@ def calculate(fund_codes, holdings_data, market_map):
             
             chg = 0.0
             found = False
-            # 匹配行情
             for k in [sc, "0"+sc, sc.split('.')[0]]:
                 if k in market_map:
                     chg = market_map[k]
                     found = True
                     break
-            # 港股额外检查
             if not found and len(sc) == 5 and sc in market_map:
                 chg = market_map[sc]
 
@@ -183,29 +176,35 @@ def calculate(fund_codes, holdings_data, market_map):
         })
     return final_list
 
-# --- 样式 ---
-def style_color(val):
+# ==========================================
+# 4. 样式函数 (关键修改：移除 Matplotlib 依赖)
+# ==========================================
+def style_text_color(val):
+    """文字颜色：红涨绿跌"""
     if not isinstance(val, (int, float)): return ''
-    c = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
-    return f'color: {c}; font-weight: bold'
+    color = '#d32f2f' if val > 0 else '#2e7d32' if val < 0 else 'black'
+    return f'color: {color}; font-weight: bold'
 
-def style_bg(val):
+def style_bg_color(val):
+    """背景颜色：纯 CSS 实现，不需要 Matplotlib"""
     if not isinstance(val, (int, float)): return ''
-    if val > 0: return 'background-color: #ffcdd2; color: black'
-    if val < 0: return 'background-color: #c8e6c9; color: black'
+    if val > 0:
+        return 'background-color: #ffcdd2; color: black' # 浅红背景
+    elif val < 0:
+        return 'background-color: #c8e6c9; color: black' # 浅绿背景
     return ''
 
 # --- 界面 ---
 with st.sidebar:
     st.header("🛡️ 控制台")
     
-    # ⭐ 核心修改：加了一个 key="v2"，这会强制 Streamlit 把它当成新组件，彻底清空旧缓存 ⭐
+    # 强制更新 Key，确保输入框清空
     codes_input = st.text_area(
         "代码池", 
         value="", 
-        placeholder="请直接粘贴代码，例如：\n161226", 
+        placeholder="请粘贴代码，例如：\n161226\n005827", 
         height=200,
-        key="fund_input_v2_new" 
+        key="fund_input_v3_final" 
     )
     
     fund_codes = [x.strip() for x in codes_input.split('\n') if x.strip()]
@@ -221,12 +220,11 @@ with st.sidebar:
 # 主逻辑
 if refresh or update or 'res_final' not in st.session_state:
     if not fund_codes:
-        st.info("👈 咱们重新开始！请在左侧输入代码。")
+        st.info("👈 请在左侧输入代码开始")
     else:
         with st.spinner("📦 正在挖掘数据..."):
             holdings, logs = get_all_fund_holdings_final(fund_codes)
         
-        # 显示日志
         with st.sidebar.status("📜 运行日志", expanded=False):
             for l in logs: st.write(l)
             
@@ -241,8 +239,9 @@ if 'res_final' in st.session_state and fund_codes:
     df = pd.DataFrame(st.session_state['res_final'])
     
     st.subheader("🛡️ 估值看板")
+    # 使用自定义的 style_text_color
     st.dataframe(
-        df[['代码', '名称', '估值', '状态', '数据源']].style.applymap(style_color, subset=['估值'])
+        df[['代码', '名称', '估值', '状态', '数据源']].style.applymap(style_text_color, subset=['估值'])
         .format({"估值": "{:+.2f}%"}), use_container_width=True, hide_index=True
     )
     
@@ -258,10 +257,11 @@ if 'res_final' in st.session_state and fund_codes:
             c2.metric("估值", f"{tgt['估值']:.2f}%")
             c3.metric("数据来源", tgt['数据源'])
             
+            # 关键修复点：这里不再用 background_gradient，而是用自定义的 style_bg_color
             st.dataframe(
                 tgt['明细'].style
-                .applymap(style_bg, subset=['今日涨跌%'])
-                .applymap(style_color, subset=['贡献度'])
+                .applymap(style_bg_color, subset=['今日涨跌%']) # 修复点
+                .applymap(style_text_color, subset=['贡献度'])
                 .format({"权重": "{:.2f}%", "今日涨跌%": "{:.2f}%", "贡献度": "{:.4f}%"}),
                 use_container_width=True, hide_index=True
             )
